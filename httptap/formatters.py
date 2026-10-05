@@ -4,6 +4,8 @@ This module provides formatters for converting metrics and data
 into human-readable formats with Rich markup support.
 """
 
+from collections.abc import Sequence
+
 from rich.markup import escape
 from rich.panel import Panel
 from rich.text import Text
@@ -22,7 +24,7 @@ from .constants import (
     PROXY_SOURCE_NO_PROXY,
 )
 from .models import StepMetrics
-from .slo import SLOResult
+from .slo import SLOCheck, SLOResult, SLOScope, SLOViolation
 
 
 def format_step_header(step: StepMetrics) -> str:
@@ -238,20 +240,12 @@ def format_metrics_line(
     if step.network.tls_version:
         parts.append(f"tls_version={step.network.tls_version}")
 
-    if step.proxied_via:
-        src = step.network.proxy_source
-        hint = "arg" if src == PROXY_SOURCE_CLI else f"env:{src}"
-        parts.append(f"proxy={step.proxied_via} proxy_from={hint}")
-    elif step.network.proxy_source == PROXY_SOURCE_NO_PROXY:
-        parts.append("proxy=none proxy_from=env:no_proxy")
-    elif step.network.proxy_source == PROXY_SOURCE_DISABLED:
-        parts.append('proxy=disabled proxy_from=--proxy ""')
-    elif step.network.proxy_source == PROXY_SOURCE_NO_MATCH:
-        parts.append("proxy=direct proxy_from=no_scheme_match")
-    else:
-        parts.append("proxy=direct")
+    parts.extend(_proxy_tokens(step))
 
     if slo_result is not None:
+        if not slo_result.is_legacy:
+            parts.extend(_enriched_slo_tokens(slo_result))
+
         if slo_result.passed:
             parts.append("slo=pass")
         else:
@@ -260,6 +254,39 @@ def format_metrics_line(
             parts.append(f"slo_violations={violated}")
 
     return f"Step {step.step_number}: {' '.join(parts)}"
+
+
+def _proxy_tokens(step: StepMetrics) -> list[str]:
+    """Build the proxy/proxy_from token(s) for one step."""
+    if step.proxied_via:
+        src = step.network.proxy_source
+        hint = "arg" if src == PROXY_SOURCE_CLI else f"env:{src}"
+        return [f"proxy={step.proxied_via} proxy_from={hint}"]
+    if step.network.proxy_source == PROXY_SOURCE_NO_PROXY:
+        return ["proxy=none proxy_from=env:no_proxy"]
+    if step.network.proxy_source == PROXY_SOURCE_DISABLED:
+        return ['proxy=disabled proxy_from=--proxy ""']
+    if step.network.proxy_source == PROXY_SOURCE_NO_MATCH:
+        return ["proxy=direct proxy_from=no_scheme_match"]
+    return ["proxy=direct"]
+
+
+def _enriched_slo_tokens(result: SLOResult) -> list[str]:
+    """Build scope/per-check tokens for an enriched (non-legacy) SLO result."""
+    tokens = [f"slo_scope={result.scope.value}"]
+    for check in result.checks:
+        check_steps = check.steps
+        if check.scope is SLOScope.EACH and check.passed:
+            # Passing 'each' checks record every examined hop.
+            check_steps = tuple(sv.step for sv in check.step_values)
+        tokens.append(f"slo_{check.key}={'pass' if check.passed else 'fail'}")
+        tokens.append(f"slo_{check.key}_steps={','.join(str(n) for n in check_steps)}")
+        if check.baseline_ms is not None:
+            tokens.append(f"slo_{check.key}_baseline={check.baseline_ms:.1f}")
+            tokens.append(f"slo_{check.key}_current={check.current_ms:.1f}")
+            if check.relative_pct is not None:
+                tokens.append(f"slo_{check.key}_pct={check.relative_pct:.1f}")
+    return tokens
 
 
 def format_compact_line(step: StepMetrics) -> str:
@@ -302,7 +329,12 @@ def format_compact_line(step: StepMetrics) -> str:
 
 
 def format_slo_panel(result: SLOResult) -> Panel:
-    """Render SLO thresholds and any violations as a Rich panel.
+    """Render SLO budgets and any violations as a Rich panel.
+
+    The legacy path (default ``final`` scope, absolute budgets, no
+    baseline) renders exactly as before. Enriched targets additionally
+    show the scope, resolved thresholds, baseline comparison figures,
+    and the hops each check concerns.
 
     Args:
         result: Evaluated SLO result.
@@ -315,27 +347,103 @@ def format_slo_panel(result: SLOResult) -> Panel:
     border = "green" if result.passed else "red"
 
     body = Text()
-    body.append("Thresholds: ", style="bold")
-    if result.thresholds_ms:
-        parts = [f"{key}≤{value:g}ms" for key, value in sorted(result.thresholds_ms.items())]
-        body.append(", ".join(parts))
-    else:
-        body.append("(none)", style="dim")
+    if result.is_legacy:
+        body.append("Thresholds: ", style="bold")
+        if result.thresholds_ms:
+            parts = [f"{key}≤{value:g}ms" for key, value in sorted(result.thresholds_ms.items())]
+            body.append(", ".join(parts))
+        else:
+            body.append("(none)", style="dim")
+
+        if not result.passed:
+            body.append("\n")
+            body.append("Violations:\n", style="bold red")
+            for violation in result.violations:
+                body.append(
+                    f"  • {violation.key}: "
+                    f"{violation.actual_ms:.1f}ms > {violation.threshold_ms:g}ms "
+                    f"(+{violation.delta_ms:.1f}ms)\n",
+                    style="red",
+                )
+
+        return Panel(body, title=title, border_style=border, padding=(0, 1))
+
+    body.append("Scope: ", style="bold")
+    body.append(_scope_description(result.scope))
+
+    body.append("Budgets: ", style="bold")
+    budget_parts = [_budget_description(check) for check in result.checks]
+    body.append(", ".join(budget_parts) if budget_parts else "(none)", style="dim" if not budget_parts else "")
+    body.append(" ")
+
+    # Measured values vs baseline are audited on pass as well as fail.
+    if any(check.baseline_ms is not None for check in result.checks):
+        body.append("Results: ", style="bold")
+        body.append(", ".join(_result_description(check) for check in result.checks))
 
     if not result.passed:
         body.append("\n")
         body.append("Violations:\n", style="bold red")
-        for violation in result.violations:
-            body.append(
-                f"  • {violation.key}: "
-                f"{violation.actual_ms:.1f}ms > {violation.threshold_ms:g}ms "
-                f"(+{violation.delta_ms:.1f}ms)\n",
-                style="red",
-            )
+        for violation, check in zip(result.violations, _checks_by_key(result, result.violations), strict=True):
+            body.append(_format_enriched_violation(violation, check), style="red")
 
-    return Panel(
-        body,
-        title=title,
-        border_style=border,
-        padding=(0, 1),
+    return Panel(body, title=title, border_style=border, padding=(0, 1))
+
+
+def _scope_description(scope: SLOScope) -> str:
+    """Return one-line human description of a non-default scope."""
+    if scope is SLOScope.CHAIN:
+        return "chain — each phase aggregated across every successful hop (rule: sum).\n"
+    return "each — every hop checked against the budgets individually.\n"
+
+
+def _budget_description(check: SLOCheck) -> str:
+    """Render one resolved budget for the panel body."""
+    if check.budget_pct is not None:
+        sign = "+" if check.budget_pct > 0 else ""
+        base = check.step_values[0].baseline_ms if check.scope is SLOScope.FINAL else check.baseline_ms
+        return f"{check.key}≤{sign}{check.budget_pct:g}% (baseline {base:.1f}ms → limit {check.threshold_ms:.1f}ms)"
+    return f"{check.key}≤{check.threshold_ms:g}ms"
+
+
+def _result_description(check: SLOCheck) -> str:
+    """Render the measured outcome of one check vs its baseline."""
+    if check.relative_pct is not None:
+        sign = "+" if check.relative_pct > 0 else ""
+        pct = f"{sign}{check.relative_pct:.1f}%"
+    else:
+        pct = "undefined%"  # Baseline value was zero.
+    return f"{check.key}: {check.current_ms:.1f}ms vs baseline {check.baseline_ms:.1f}ms ({pct})"
+
+
+def _checks_by_key(
+    result: SLOResult,
+    violations: Sequence[SLOViolation],
+) -> list[SLOCheck]:
+    """Look up the check record paired with each violation (keyed)."""
+    by_key = {check.key: check for check in result.checks}
+    return [by_key[v.key] for v in violations]
+
+
+def _format_enriched_violation(violation: SLOViolation, check: SLOCheck) -> str:
+    """Render one violation line including scope/baseline/step details."""
+    line = (
+        f"  • {violation.key}: {violation.actual_ms:.1f}ms > {violation.threshold_ms:.1f}ms "
+        f"(+{violation.delta_ms:.1f}ms over budget)"
     )
+    if violation.baseline_ms is not None and violation.relative_pct is not None:
+        sign = "+" if violation.relative_pct > 0 else ""
+        line += f" | baseline {violation.baseline_ms:.1f}ms, {sign}{violation.relative_pct:.1f}%"
+    line += "\n"
+
+    if check.scope is SLOScope.CHAIN:
+        hops = " ".join(f"{sv.step}={sv.current_ms:.1f}ms" for sv in check.step_values)
+        line += f"      hops: {hops}\n"
+    elif check.scope is SLOScope.EACH:
+        bad = set(violation.steps)
+        hops = " ".join(f"{sv.step}={sv.current_ms:.1f}ms" for sv in check.step_values if sv.step in bad)
+        line += f"      violating hops: {hops}\n"
+    elif violation.steps:
+        line += f"      step {violation.steps[0]}\n"
+
+    return line

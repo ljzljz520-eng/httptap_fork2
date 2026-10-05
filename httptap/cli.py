@@ -39,10 +39,15 @@ from .models import StepMetrics
 from .render import OutputRenderer
 from .slo import (
     SLO_KEYS,
+    SLOBaselineError,
     SLOResult,
+    SLOScope,
     SLOSpecError,
+    SLOTarget,
     evaluate_slo,
-    parse_slo_spec,
+    evaluate_target,
+    load_baseline,
+    parse_slo_target,
     select_step_for_evaluation,
 )
 from .utils import read_request_data, validate_url
@@ -282,12 +287,25 @@ Exit codes:
     slo_keys_hint = ", ".join(sorted(SLO_KEYS))
     output_group.add_argument(
         "--slo",
-        metavar="KEY=MS[,KEY=MS...]",
+        metavar="[SCOPE.]KEY=VALUE[,...]",
         default=None,
         help=(
-            "Check the final successful step against per-phase latency budgets "
-            "in milliseconds. On violation httptap still prints the full report "
-            f"but exits with code {EXIT_SLO_VIOLATION}. Valid keys: {slo_keys_hint}."
+            "Check latency budgets. VALUE is a positive number of milliseconds; "
+            "SCOPE is final (default: last successful step), chain (per-phase sum "
+            "across all hops, e.g. chain.total=300), or each (every hop checked). "
+            "On violation httptap still prints the full report but exits with code "
+            f"{EXIT_SLO_VIOLATION}. Valid keys: {slo_keys_hint}."
+        ),
+    )
+    output_group.add_argument(
+        "--slo-baseline",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Use httptap JSON report PATH as the baseline: fingerprints must match "
+            "(method, normalized sources, status sequence, final target) and budgets "
+            "may be relative, e.g. --slo chain.total=+20%%. Mismatches exit with the "
+            "usage error code."
         ),
     )
 
@@ -356,34 +374,66 @@ def _export_results(
 
 def _evaluate_slo(
     steps: list[StepMetrics],
-    thresholds: Mapping[str, float],
+    target: SLOTarget,
+    *,
+    baseline_path: str | None = None,
 ) -> SLOResult | None:
-    """Evaluate SLO thresholds against the final successful step.
+    """Evaluate an SLO target against the request chain.
+
+    Precedence rules preserved from the legacy behavior:
+
+    * An empty target disables evaluation (``None``).
+    * When any step failed, network errors win. Baseline loading and
+      fingerprint comparison are skipped entirely in that case, so no
+      baseline mismatch can masquerade as — or outrank — the network
+      failure. Non-default scopes are likewise skipped; the legacy
+      final/absolute path still evaluates the last successful step.
+    * Relative budgets require a baseline, which is loaded and aligned
+      before thresholds resolve.
 
     Args:
         steps: Analysis steps.
-        thresholds: Parsed ``--slo`` specification produced by
-            :func:`parse_slo_spec`. An empty mapping disables
-            evaluation.
+        target: Parsed SLO target.
+        baseline_path: Path to the baseline report, or ``None``.
 
     Returns:
-        :class:`SLOResult` when thresholds were supplied and there is
-        at least one successful step to evaluate; ``None`` otherwise.
+        :class:`SLOResult` when evaluation ran, ``None`` otherwise.
 
     Raises:
-        SLOSpecError: Propagated from :func:`evaluate_slo` if
-            ``thresholds`` contains a key outside :data:`SLO_KEYS`.
-            The CLI pipeline validates input via
-            :func:`parse_slo_spec` earlier, so this should not happen
-            in practice.
+        SLOBaselineError: When the baseline cannot be loaded or its
+            fingerprint does not match the current request.
+        SLOSpecError: Propagated from evaluation on invalid keys.
 
     """
-    if not thresholds:
+    if not target.budgets:
         return None
+
+    has_network_error = any(step.has_error for step in steps)
+    if has_network_error:
+        # Network failures outrank everything. Only the legacy final /
+        # absolute path still evaluates the last successful step; baseline
+        # loading and non-final scopes are skipped.
+        if target.scope is SLOScope.FINAL and baseline_path is None:
+            return _legacy_final_slo(steps, target)
+        return None
+
+    if baseline_path is not None:
+        baseline = load_baseline(baseline_path)
+        return evaluate_target(steps, target, baseline=baseline)
+
+    if target.scope is not SLOScope.FINAL:
+        return evaluate_target(steps, target)
+
+    return _legacy_final_slo(steps, target)
+
+
+def _legacy_final_slo(steps: list[StepMetrics], target: SLOTarget) -> SLOResult | None:
+    """Evaluate absolute final budgets against the last successful step."""
     step = select_step_for_evaluation(steps)
     if step is None:
         return None
-    return evaluate_slo(step, thresholds)
+    thresholds = {budget.key: budget.absolute_ms for budget in target.budgets}
+    return evaluate_slo(step, thresholds)  # type: ignore[arg-type]
 
 
 def validate_arguments(args: argparse.Namespace) -> bool:
@@ -461,11 +511,41 @@ def validate_arguments(args: argparse.Namespace) -> bool:
             return False
         args.ca_bundle = str(Path(ca_bundle_str).expanduser().absolute())
 
+    slo_baseline = getattr(args, "slo_baseline", None)
+    return _validate_slo_arguments(args, slo_baseline)
+
+
+def _validate_slo_arguments(args: argparse.Namespace, slo_baseline: str | None) -> bool:
+    """Validate ``--slo`` / ``--slo-baseline`` and populate ``args.slo_target``."""
+    if slo_baseline is not None and not str(slo_baseline).strip():
+        console.print(
+            Panel(
+                "[red]--slo-baseline path cannot be empty. Supply an httptap JSON report.[/red]",
+                title="[bold red]❌ SLO Error[/bold red]",
+                border_style="red",
+                padding=(1, 2),
+            )
+        )
+        return False
+
     if args.slo is None:
-        args.slo_thresholds = {}
+        if slo_baseline is not None:
+            console.print(
+                Panel(
+                    "[red]--slo-baseline requires --slo with budgets, e.g. --slo chain.total=+20%.[/red]",
+                    title="[bold red]❌ SLO Error[/bold red]",
+                    border_style="red",
+                    padding=(1, 2),
+                )
+            )
+            return False
+        args.slo_target = SLOTarget()
     else:
         try:
-            args.slo_thresholds = parse_slo_spec(args.slo)
+            args.slo_target = parse_slo_target(
+                args.slo,
+                baseline_allowed=slo_baseline is not None,
+            )
         except SLOSpecError as exc:
             console.print(
                 Panel(
@@ -520,6 +600,30 @@ def determine_exit_code(
     return EXIT_SUCCESS
 
 
+def _prepare_request(
+    args: argparse.Namespace,
+) -> tuple[bytes | None, HTTPMethod, dict[str, str]]:
+    """Read the request body, resolve the method, and merge headers."""
+    content, auto_headers = read_request_data(args.data)
+    method_was_explicit = args.method is not None
+    method: HTTPMethod = args.method if method_was_explicit else HTTPMethod.GET
+
+    if content and method == HTTPMethod.GET and not method_was_explicit:
+        method = HTTPMethod.POST
+        logger.info("Auto-switching from GET to POST due to request body")
+
+    if content and method in (HTTPMethod.GET, HTTPMethod.HEAD) and method_was_explicit:
+        logger.warning(
+            "%s requests with body are uncommon but allowed. Consider using POST, PUT, or PATCH.",
+            method.value,
+        )
+
+    headers_dict = dict(auto_headers)
+    if args.headers:
+        headers_dict.update(args.headers)
+    return content, method, headers_dict
+
+
 def main() -> int:
     """Run the CLI with Rich UI enhancements.
 
@@ -544,26 +648,10 @@ def main() -> int:
             console.print("[yellow]Warning:[/yellow] --compact is ignored because --metrics-only takes precedence.")
 
         try:
-            content, auto_headers = read_request_data(args.data)
+            content, method, headers_dict = _prepare_request(args)
         except (FileNotFoundError, OSError) as e:
             console.print(f"[red]Error reading data: {escape(str(e))}[/red]")
             return EXIT_USAGE_ERROR
-        method = args.method if args.method is not None else HTTPMethod.GET
-        method_was_explicit = args.method is not None
-
-        if content and method == HTTPMethod.GET and not method_was_explicit:
-            method = HTTPMethod.POST
-            logger.info("Auto-switching from GET to POST due to request body")
-
-        if content and method in (HTTPMethod.GET, HTTPMethod.HEAD) and method_was_explicit:
-            logger.warning(
-                "%s requests with body are uncommon but allowed. Consider using POST, PUT, or PATCH.",
-                method.value,
-            )
-
-        headers_dict = dict(auto_headers)
-        if args.headers:
-            headers_dict.update(args.headers)
 
         noproxy = args.proxy == ""
         analyzer = HTTPTapAnalyzer(
@@ -582,7 +670,10 @@ def main() -> int:
         )
 
         steps = _execute_analysis(analyzer, args, method, content, headers_dict)
-        slo_result = _evaluate_slo(steps, args.slo_thresholds)
+        slo_result, baseline_error_code = _run_slo_evaluation(steps, args)
+        if baseline_error_code is not None:
+            return baseline_error_code
+
         renderer.render_analysis(steps, args.url, slo_result=slo_result)
         _export_results(renderer, steps, args, slo_result=slo_result)
 
@@ -603,6 +694,30 @@ def main() -> int:
         )
         console.print(error_panel)
         return EXIT_FATAL_ERROR
+
+
+def _run_slo_evaluation(
+    steps: list[StepMetrics],
+    args: argparse.Namespace,
+) -> tuple[SLOResult | None, int | None]:
+    """Evaluate SLOs, mapping baseline errors to a usage exit code."""
+    try:
+        result = _evaluate_slo(
+            steps,
+            args.slo_target,
+            baseline_path=args.slo_baseline,
+        )
+    except SLOBaselineError as exc:
+        console.print(
+            Panel(
+                f"[red]{escape(str(exc))}[/red]",
+                title="[bold red]❌ SLO Baseline Error[/bold red]",
+                border_style="red",
+                padding=(1, 2),
+            )
+        )
+        return None, EXIT_USAGE_ERROR
+    return result, None
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from typing import cast
 
 import pytest
 
@@ -21,7 +22,7 @@ from httptap.formatters import (
     format_step_header,
 )
 from httptap.models import NetworkInfo, ResponseInfo, StepMetrics, TimingMetrics
-from httptap.slo import SLOResult, SLOViolation
+from httptap.slo import SLOCheck, SLOResult, SLOScope, SLOStepValue, SLOViolation
 
 
 def build_step(status: int) -> StepMetrics:
@@ -653,3 +654,203 @@ class TestFormatSLOPanel:
 
         assert "SLO: pass" in text
         assert "(none)" in text
+
+    @staticmethod
+    def _check(scope: SLOScope, spec: dict[str, object]) -> SLOCheck:
+        """Build a check from a compact spec (values/steps/baseline/pcts)."""
+        raw_values = cast("tuple[tuple[int, float], ...]", spec["values"])
+        raw_baseline = cast("tuple[float, ...] | None", spec.get("baseline"))
+        step_values = tuple(
+            SLOStepValue(
+                step=number,
+                current_ms=value,
+                baseline_ms=raw_baseline[index] if raw_baseline is not None else None,
+            )
+            for index, (number, value) in enumerate(raw_values)
+        )
+
+        if scope is SLOScope.CHAIN:
+            current = sum(value for _number, value in raw_values)
+            baseline_ms: float | None = sum(raw_baseline) if raw_baseline is not None else None
+        else:
+            current = max(value for _number, value in raw_values)
+            baseline_ms = None
+
+        budget_pct = cast("float | None", spec.get("budget_pct"))
+        if "threshold_ms" in spec:
+            threshold = cast("float", spec["threshold_ms"])
+        elif baseline_ms is not None and budget_pct is not None:
+            threshold = baseline_ms * (1.0 + budget_pct / 100.0)
+        else:
+            threshold = 100.0
+
+        if "measured_pct" in spec:
+            measured_pct = cast("float | None", spec["measured_pct"])
+        elif baseline_ms is not None:
+            measured_pct = (current - baseline_ms) / baseline_ms * 100.0
+        else:
+            measured_pct = None
+
+        default_steps = tuple(number for number, _value in raw_values)
+        return SLOCheck(
+            key="total",
+            passed=cast("bool", spec.get("passed", True)),
+            scope=scope,
+            threshold_ms=threshold,
+            current_ms=current,
+            steps=cast("tuple[int, ...]", spec.get("steps", default_steps)),
+            step_values=step_values,
+            baseline_ms=baseline_ms,
+            relative_pct=measured_pct,
+            budget_pct=budget_pct,
+            aggregation="sum" if scope is SLOScope.CHAIN else None,
+        )
+
+    def test_each_fail_panel_lists_violating_hop(self) -> None:
+        check = self._check(
+            SLOScope.EACH,
+            {"passed": False, "steps": (1,), "values": ((1, 400.0), (2, 50.0))},
+        )
+        result = SLOResult(
+            thresholds_ms={"total": 100.0},
+            violations=(
+                SLOViolation(
+                    key="total",
+                    threshold_ms=100.0,
+                    actual_ms=400.0,
+                    scope="each",
+                    steps=(1,),
+                ),
+            ),
+            scope=SLOScope.EACH,
+            checks=(check,),
+        )
+
+        text = self._panel_text(result)
+
+        assert "SLO: fail" in text
+        assert "each" in text
+        assert "violating hops: 1=400.0ms" in text
+
+    def test_chain_pass_panel_shows_baseline_result(self) -> None:
+        check = self._check(
+            SLOScope.CHAIN,
+            {
+                "values": ((1, 238.0), (2, 297.5)),
+                "baseline": (200.0, 250.0),
+                "budget_pct": 20.0,
+                "measured_pct": 19.0,
+            },
+        )
+        result = SLOResult(
+            thresholds_ms={"total": 540.0},
+            violations=(),
+            scope=SLOScope.CHAIN,
+            checks=(check,),
+            baseline_path="baseline.json",
+        )
+
+        text = self._panel_text(result)
+
+        assert "SLO: pass" in text
+        assert "chain" in text
+        assert "baseline 450.0ms" in text
+        assert "535.5ms" in text
+        assert "19.0%" in text
+
+    def test_undefined_pct_panel(self) -> None:
+        check = self._check(
+            SLOScope.CHAIN,
+            {
+                "passed": False,
+                "values": ((1, 10.0), (2, 0.0)),
+                "baseline": (0.0, 0.0),
+                "budget_pct": 20.0,
+                "measured_pct": None,
+            },
+        )
+        result = SLOResult(
+            thresholds_ms={"total": 0.0},
+            violations=(
+                SLOViolation(
+                    key="total",
+                    threshold_ms=0.0,
+                    actual_ms=10.0,
+                    scope="chain",
+                    steps=(1, 2),
+                ),
+            ),
+            scope=SLOScope.CHAIN,
+            checks=(check,),
+            baseline_path="zero.json",
+        )
+
+        text = self._panel_text(result)
+
+        assert "undefined%" in text
+
+
+class TestFormatMetricsLineEnriched:
+    """Scope and baseline tokens on the metrics-only line."""
+
+    @staticmethod
+    def _check(scope: SLOScope, *, passed: bool, steps: tuple[int, ...]) -> SLOCheck:
+        values = tuple(SLOStepValue(step=n, current_ms=400.0 if n == 1 else 50.0) for n in steps)
+        return SLOCheck(
+            key="total",
+            passed=passed,
+            scope=scope,
+            threshold_ms=300.0,
+            current_ms=450.0,
+            steps=() if passed else steps,
+            step_values=values,
+            baseline_ms=450.0,
+            relative_pct=0.0,
+            budget_pct=20.0,
+            aggregation="sum" if scope is SLOScope.CHAIN else None,
+        )
+
+    def test_chain_fail_tokens(self) -> None:
+        check = self._check(SLOScope.CHAIN, passed=False, steps=(1, 2))
+        result = SLOResult(
+            thresholds_ms={"total": 300.0},
+            violations=(
+                SLOViolation(
+                    key="total",
+                    threshold_ms=300.0,
+                    actual_ms=450.0,
+                    scope="chain",
+                    baseline_ms=450.0,
+                    relative_pct=0.0,
+                    steps=(1, 2),
+                ),
+            ),
+            scope=SLOScope.CHAIN,
+            checks=(check,),
+            baseline_path="baseline.json",
+        )
+        line = format_metrics_line(build_step(200), slo_result=result)
+
+        assert "slo_scope=chain" in line
+        assert "slo_total=fail" in line
+        assert "slo_total_steps=1,2" in line
+        assert "slo_total_baseline=450.0" in line
+        assert "slo_total_current=450.0" in line
+        assert "slo_total_pct=0.0" in line
+        assert "slo=fail" in line
+        assert "slo_violations=total" in line
+
+    def test_each_pass_tokens_list_all_hops(self) -> None:
+        check = self._check(SLOScope.EACH, passed=True, steps=(1, 2))
+        result = SLOResult(
+            thresholds_ms={"total": 300.0},
+            violations=(),
+            scope=SLOScope.EACH,
+            checks=(check,),
+        )
+        line = format_metrics_line(build_step(200), slo_result=result)
+
+        assert "slo_scope=each" in line
+        assert "slo_total=pass" in line
+        assert "slo_total_steps=1,2" in line
+        assert line.endswith("slo=pass")

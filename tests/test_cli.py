@@ -323,6 +323,36 @@ def test_validate_arguments_cacert_empty_string(
     assert result is False
 
 
+def test_validate_arguments_slo_baseline_empty_string_fails() -> None:
+    """A whitespace-only --slo-baseline path fails validation."""
+    args = Namespace(
+        url="https://example.test",
+        timeout=5,
+        headers=[],
+        ignore_ssl=False,
+        ca_bundle=None,
+        slo="chain.total=100",
+        slo_baseline="   ",
+    )
+
+    assert validate_arguments(args) is False
+
+
+def test_validate_arguments_slo_baseline_without_slo_fails() -> None:
+    """--slo-baseline without --slo budgets fails validation."""
+    args = Namespace(
+        url="https://example.test",
+        timeout=5,
+        headers=[],
+        ignore_ssl=False,
+        ca_bundle=None,
+        slo=None,
+        slo_baseline="baseline.json",
+    )
+
+    assert validate_arguments(args) is False
+
+
 def test_validate_arguments_cacert_expanduser() -> None:
     """Test that tilde expansion works for CA bundle path."""
     from pathlib import Path
@@ -989,3 +1019,604 @@ def test_determine_exit_code_network_error_overrides_slo() -> None:
     violation = SLOViolation(key="total", threshold_ms=500.0, actual_ms=900.0)
     result = SLOResult(thresholds_ms={"total": 500.0}, violations=(violation,))
     assert determine_exit_code([step], slo_result=result) == EXIT_NETWORK_ERROR
+
+
+# ===========================================================================
+# Acceptance tests for the explicit SLO target model and baseline budgets
+# ===========================================================================
+
+
+# Redirect chain URLs and the fixed baseline numbers (per-hop totals).
+_START_URL = "https://hop.test/start"
+_FINAL_URL = "https://hop.test/final"
+
+
+def _hop(
+    *,
+    url: str = _START_URL,
+    status: int = 301,
+    total: float = 400.0,
+    method: str | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    return {"url": url, "status": status, "total": total, "method": method, "error": error}
+
+
+class _ChainAnalyzerStub:
+    """Analyzer stub returning a configurable multi-hop chain."""
+
+    def __init__(self, hops: list[dict[str, Any]]) -> None:
+        self._hops = hops
+
+    def analyze_url(
+        self,
+        url: str,
+        *,
+        method: HTTPMethod = HTTPMethod.GET,
+        content: bytes | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> list[StepMetrics]:
+        del url, content, headers
+        steps: list[StepMetrics] = []
+        for index, hop in enumerate(self._hops):
+            m = hop["method"] or (method.value if index == 0 else "GET")
+            error = hop["error"]
+            timing = TimingMetrics(total_ms=hop["total"])
+            timing.calculate_derived()
+            steps.append(
+                StepMetrics(
+                    url=hop["url"],
+                    step_number=index + 1,
+                    timing=timing,
+                    network=NetworkInfo(ip="203.0.113.1") if not error else NetworkInfo(),
+                    response=ResponseInfo(status=hop["status"]) if not error else ResponseInfo(),
+                    error=error,
+                    request_method=m,
+                )
+            )
+        return steps
+
+
+def _install_chain_stub(monkeypatch: pytest.MonkeyPatch, hops: list[dict[str, Any]]) -> None:
+    stub = _ChainAnalyzerStub(hops)
+    monkeypatch.setattr(
+        "httptap.cli.HTTPTapAnalyzer",
+        lambda *_args, **_kwargs: stub,
+    )
+
+
+def _baseline_payload(hops: list[tuple[str, int, str, float]]) -> dict[str, Any]:
+    return {
+        "initial_url": hops[0][0],
+        "total_steps": len(hops),
+        "steps": [
+            {
+                "url": url,
+                "step_number": index + 1,
+                "request": {"method": hop_method, "headers": {}, "body_bytes": 0},
+                "timing": {
+                    "dns_ms": 0.0,
+                    "connect_ms": 0.0,
+                    "tls_ms": 0.0,
+                    "ttfb_ms": 0.0,
+                    "total_ms": total,
+                    "wait_ms": 0.0,
+                    "xfer_ms": 0.0,
+                    "is_estimated": False,
+                },
+                "response": {"status": status},
+                "error": None,
+            }
+            for index, (url, status, hop_method, total) in enumerate(hops)
+        ],
+        "summary": {},
+    }
+
+
+def _write_baseline(
+    path: Path,
+    hops: list[tuple[str, int, str, float]],
+) -> str:
+    output = str(path)
+    path.write_text(json.dumps(_baseline_payload(hops)), encoding="utf-8")
+    return output
+
+
+# Fixed baseline: 200ms first hop + 250ms final hop = 450ms chain total.
+_BASELINE_HOPS: list[tuple[str, int, str, float]] = [
+    (_START_URL, 301, "GET", 200.0),
+    (_FINAL_URL, 200, "GET", 250.0),
+]
+
+
+def _run_main(argv: list[str], monkeypatch: pytest.MonkeyPatch) -> int:
+    monkeypatch.setattr("sys.argv", ["httptap", *argv])
+    return main()
+
+
+def _lines(text: str) -> list[str]:
+    """Return only the per-step output lines (Step N: ...)."""
+    return [line for line in text.splitlines() if line.startswith("Step ")]
+
+
+# ---------------------------------------------------------------------------
+# Acceptance 1: final.total=100 passes, chain.total=300 fails, outputs agree
+# ---------------------------------------------------------------------------
+
+
+class TestScopeConsistency:
+    """400ms first hop + 50ms final hop chain."""
+
+    def _hops(self, **overrides: object) -> list[dict[str, Any]]:
+        hops = [_hop(total=400.0), _hop(url=_FINAL_URL, status=200, total=50.0)]
+        if overrides:
+            index = overrides.pop("index", 0)
+            hops[index].update(overrides)  # type: ignore[arg-type]
+        return hops
+
+    def test_final_total_100_passes_metrics_json(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        _install_chain_stub(monkeypatch, self._hops())
+        json_path = tmp_path / "report.json"
+        exit_code = _run_main(
+            [
+                "--metrics-only",
+                "--slo",
+                "final.total=100",
+                "--json",
+                str(json_path),
+                _START_URL,
+            ],
+            monkeypatch,
+        )
+
+        assert exit_code == EXIT_SUCCESS
+        output = capsys.readouterr().out
+        step1, step2 = _lines(output)
+        assert "slo=" not in step1
+        assert "slo=pass" in step2
+
+        payload = json.loads(json_path.read_text())
+        assert payload["summary"]["slo"] == {
+            "pass": True,
+            "thresholds_ms": {"total": 100.0},
+            "violations": [],
+        }
+
+    def test_final_total_100_passes_rich(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _install_chain_stub(monkeypatch, self._hops())
+        exit_code = _run_main(["--slo", "final.total=100", _START_URL], monkeypatch)
+
+        assert exit_code == EXIT_SUCCESS
+        assert "SLO: pass" in capsys.readouterr().out
+
+    def test_chain_total_300_fails_metrics_json(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        _install_chain_stub(monkeypatch, self._hops())
+        json_path = tmp_path / "report.json"
+        exit_code = _run_main(
+            [
+                "--metrics-only",
+                "--slo",
+                "chain.total=300",
+                "--json",
+                str(json_path),
+                _START_URL,
+            ],
+            monkeypatch,
+        )
+
+        assert exit_code == EXIT_SLO_VIOLATION
+        output = capsys.readouterr().out
+        step1, step2 = _lines(output)
+        assert "slo=" not in step1
+        # Scope and actual chain value are explicit on the final hop line.
+        assert "slo_scope=chain" in step2
+        assert "slo_total=fail" in step2
+        assert "slo_total_steps=1,2" in step2
+        assert "slo=fail" in step2
+        assert "slo_violations=total" in step2
+
+        payload = json.loads(json_path.read_text())
+        slo = payload["summary"]["slo"]
+        assert slo["pass"] is False
+        assert slo["scope"] == "chain"
+        assert len(slo["checks"]) == 1
+        check = slo["checks"][0]
+        assert check["key"] == "total"
+        assert check["pass"] is False
+        assert check["scope"] == "chain"
+        assert check["threshold_ms"] == 300.0
+        assert check["current_ms"] == 450.0
+        assert check["steps"] == [1, 2]
+        assert check["aggregation"] == "sum"
+        assert check["step_values"] == [
+            {"step": 1, "current_ms": 400.0},
+            {"step": 2, "current_ms": 50.0},
+        ]
+        assert slo["violations"][0]["actual_ms"] == 450.0
+        assert slo["violations"][0]["steps"] == [1, 2]
+
+    def test_chain_total_300_fails_rich(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _install_chain_stub(monkeypatch, self._hops())
+        exit_code = _run_main(["--slo", "chain.total=300", _START_URL], monkeypatch)
+
+        assert exit_code == EXIT_SLO_VIOLATION
+        text = capsys.readouterr().out
+        assert "SLO: fail" in text
+        assert "chain" in text
+        assert "450.0" in text
+        assert "300.0" in text
+        assert "1=400.0ms" in text
+        assert "2=50.0ms" in text
+
+
+# ---------------------------------------------------------------------------
+# Acceptance 2: fixed baseline; +19% passes the +20% budget, +21% fails
+# ---------------------------------------------------------------------------
+
+
+class TestBaselineRelativeBudget:
+    """Baseline chain total 450ms, +20% budget → limit 540ms."""
+
+    def _hops(self, totals: tuple[float, float]) -> list[dict[str, Any]]:
+        return [
+            _hop(total=totals[0]),
+            _hop(url=_FINAL_URL, status=200, total=totals[1]),
+        ]
+
+    def test_plus_19_percent_passes_metrics_json(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        _install_chain_stub(monkeypatch, self._hops((238.0, 297.5)))
+        baseline_path = _write_baseline(tmp_path / "baseline.json", _BASELINE_HOPS)
+        json_path = tmp_path / "report.json"
+
+        exit_code = _run_main(
+            [
+                "--metrics-only",
+                "--slo",
+                "chain.total=+20%",
+                "--slo-baseline",
+                baseline_path,
+                "--json",
+                str(json_path),
+                _START_URL,
+            ],
+            monkeypatch,
+        )
+
+        assert exit_code == EXIT_SUCCESS
+        step2 = _lines(capsys.readouterr().out)[1]
+        assert "slo_scope=chain" in step2
+        assert "slo_total=pass" in step2
+        assert "slo_total_steps=1,2" in step2
+        assert "slo_total_baseline=450.0" in step2
+        assert "slo_total_current=535.5" in step2
+        assert "slo_total_pct=19.0" in step2
+        assert step2.endswith("slo=pass")
+
+        check = json.loads(json_path.read_text())["summary"]["slo"]["checks"][0]
+        assert check["pass"] is True
+        assert check["baseline_ms"] == 450.0
+        assert check["current_ms"] == 535.5
+        assert check["relative_pct"] == pytest.approx(19.0)
+        assert check["threshold_ms"] == 540.0
+        assert check["budget_pct"] == 20.0
+        assert check["steps"] == [1, 2]
+
+    def test_plus_19_percent_passes_rich(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        _install_chain_stub(monkeypatch, self._hops((238.0, 297.5)))
+        baseline_path = _write_baseline(tmp_path / "baseline.json", _BASELINE_HOPS)
+
+        exit_code = _run_main(
+            [
+                "--slo",
+                "chain.total=+20%",
+                "--slo-baseline",
+                baseline_path,
+                _START_URL,
+            ],
+            monkeypatch,
+        )
+
+        assert exit_code == EXIT_SUCCESS
+        text = capsys.readouterr().out
+        assert "SLO: pass" in text
+        assert "baseline 450.0ms" in text
+        assert "535.5" in text
+        assert "19.0%" in text
+
+    def test_plus_21_percent_fails_metrics_json(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        _install_chain_stub(monkeypatch, self._hops((242.0, 302.5)))
+        baseline_path = _write_baseline(tmp_path / "baseline.json", _BASELINE_HOPS)
+        json_path = tmp_path / "report.json"
+
+        exit_code = _run_main(
+            [
+                "--metrics-only",
+                "--slo",
+                "chain.total=+20%",
+                "--slo-baseline",
+                baseline_path,
+                "--json",
+                str(json_path),
+                _START_URL,
+            ],
+            monkeypatch,
+        )
+
+        assert exit_code == EXIT_SLO_VIOLATION
+        step2 = _lines(capsys.readouterr().out)[1]
+        assert "slo_total=fail" in step2
+        assert "slo_total_baseline=450.0" in step2
+        assert "slo_total_current=544.5" in step2
+        assert "slo_total_pct=21.0" in step2
+        assert "slo_violations=total" in step2
+
+        slo = json.loads(json_path.read_text())["summary"]["slo"]
+        assert slo["pass"] is False
+        check = slo["checks"][0]
+        assert check["baseline_ms"] == 450.0
+        assert check["current_ms"] == 544.5
+        assert check["relative_pct"] == pytest.approx(21.0)
+        assert check["steps"] == [1, 2]
+        violation = slo["violations"][0]
+        assert violation["baseline_ms"] == 450.0
+        assert violation["relative_pct"] == pytest.approx(21.0)
+
+    def test_plus_21_percent_fails_rich(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        _install_chain_stub(monkeypatch, self._hops((242.0, 302.5)))
+        baseline_path = _write_baseline(tmp_path / "baseline.json", _BASELINE_HOPS)
+
+        exit_code = _run_main(
+            [
+                "--slo",
+                "chain.total=+20%",
+                "--slo-baseline",
+                baseline_path,
+                _START_URL,
+            ],
+            monkeypatch,
+        )
+
+        assert exit_code == EXIT_SLO_VIOLATION
+        text = capsys.readouterr().out
+        assert "SLO: fail" in text
+        assert "baseline 450.0ms" in text
+        assert "544.5" in text
+        assert "21.0%" in text
+
+
+# ---------------------------------------------------------------------------
+# Acceptance 3: fingerprint mismatches are usage errors; network still wins
+# ---------------------------------------------------------------------------
+
+
+class TestBaselineMismatch:
+    """Each fingerprint field produces a recognizable usage error."""
+
+    _MISMATCH_CASES = (
+        # Method: CLI forces POST on hop 1, baseline recorded GET.
+        (
+            ["--request", "POST"],
+            [_hop(total=238.0), _hop(url=_FINAL_URL, status=200, total=297.5)],
+            "methods differ",
+        ),
+        # Normalized sources: hop 1 URL differs.
+        (
+            [],
+            [
+                _hop(url=_START_URL + "?x=1", total=238.0),
+                _hop(url=_FINAL_URL, status=200, total=297.5),
+            ],
+            "normalized sources differ",
+        ),
+        # Status sequence: hop 1 is 302, baseline 301.
+        (
+            [],
+            [_hop(status=302, total=238.0), _hop(url=_FINAL_URL, status=200, total=297.5)],
+            "status sequence differs",
+        ),
+        # Final target: last hop URL differs.
+        (
+            [],
+            [
+                _hop(total=238.0),
+                _hop(url="https://hop.test/other", status=200, total=297.5),
+            ],
+            "final target differ",
+        ),
+    )
+
+    @pytest.mark.parametrize("case", _MISMATCH_CASES)
+    def test_mismatch_returns_usage_error(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+        case: tuple[list[str], list[dict[str, Any]], str],
+    ) -> None:
+        extra_argv, hops, field = case
+        _install_chain_stub(monkeypatch, hops)
+        baseline_path = _write_baseline(tmp_path / "baseline.json", _BASELINE_HOPS)
+
+        exit_code = _run_main(
+            [
+                *extra_argv,
+                "--metrics-only",
+                "--slo",
+                "chain.total=+20%",
+                "--slo-baseline",
+                baseline_path,
+                _START_URL,
+            ],
+            monkeypatch,
+        )
+
+        captured = capsys.readouterr()
+        assert exit_code == EXIT_USAGE_ERROR
+        assert "SLO Baseline Error" in captured.err
+        assert field in captured.err
+
+    def test_network_error_still_takes_precedence(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        hops = [
+            _hop(total=238.0),
+            _hop(url=_FINAL_URL, status=200, total=297.5, error="connection reset"),
+        ]
+        _install_chain_stub(monkeypatch, hops)
+        # The baseline is intentionally mismatching too; network must win.
+        baseline_path = _write_baseline(tmp_path / "baseline.json", _BASELINE_HOPS)
+
+        exit_code = _run_main(
+            [
+                "--metrics-only",
+                "--slo",
+                "chain.total=+20%",
+                "--slo-baseline",
+                baseline_path,
+                _START_URL,
+            ],
+            monkeypatch,
+        )
+
+        captured = capsys.readouterr()
+        assert exit_code == EXIT_NETWORK_ERROR
+        assert "SLO Baseline Error" not in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Acceptance 4: legacy --slo total=... remains final-step-only, code 4
+# ---------------------------------------------------------------------------
+
+
+class TestLegacySLOBackwardCompat:
+    """No new syntax → exact historical behavior."""
+
+    def _hops(self) -> list[dict[str, Any]]:
+        return [
+            _hop(total=400.0),
+            _hop(url=_FINAL_URL, status=200, total=50.0),
+        ]
+
+    def test_bare_total_budget_checks_last_step_only(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        _install_chain_stub(monkeypatch, self._hops())
+        json_path = tmp_path / "report.json"
+
+        exit_code = _run_main(
+            [
+                "--metrics-only",
+                "--slo",
+                "total=100",
+                "--json",
+                str(json_path),
+                _START_URL,
+            ],
+            monkeypatch,
+        )
+
+        assert exit_code == EXIT_SUCCESS
+        step2 = _lines(capsys.readouterr().out)[1]
+        assert step2.endswith("slo=pass")
+        payload = json.loads(json_path.read_text())
+        assert payload["summary"]["slo"] == {
+            "pass": True,
+            "thresholds_ms": {"total": 100.0},
+            "violations": [],
+        }
+
+    def test_bare_total_violation_keeps_legacy_json_and_code_4(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        _install_chain_stub(monkeypatch, self._hops())
+        json_path = tmp_path / "report.json"
+
+        exit_code = _run_main(
+            [
+                "--metrics-only",
+                "--slo",
+                "total=40",
+                "--json",
+                str(json_path),
+                _START_URL,
+            ],
+            monkeypatch,
+        )
+
+        assert exit_code == EXIT_SLO_VIOLATION
+        assert "slo_violations=total" in capsys.readouterr().out
+        payload = json.loads(json_path.read_text())
+        assert payload["summary"]["slo"] == {
+            "pass": False,
+            "thresholds_ms": {"total": 40.0},
+            "violations": [
+                {
+                    "key": "total",
+                    "threshold_ms": 40.0,
+                    "actual_ms": 50.0,
+                    "delta_ms": 10.0,
+                }
+            ],
+        }
+
+    def test_baseline_flag_without_slo_is_usage_error(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+    ) -> None:
+        baseline_path = _write_baseline(tmp_path / "baseline.json", _BASELINE_HOPS)
+        exit_code = _run_main(
+            ["--slo-baseline", baseline_path, _START_URL],
+            monkeypatch,
+        )
+
+        assert exit_code == EXIT_USAGE_ERROR
+        assert "requires --slo" in capsys.readouterr().err
